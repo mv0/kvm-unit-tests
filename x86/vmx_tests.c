@@ -126,13 +126,18 @@ void preemption_timer_main()
 		if (get_stage() == 1)
 			vmcall();
 	}
-	while (1) {
+	set_stage(1);
+	while (get_stage() == 1) {
 		if (((rdtsc() - tsc_val) >> preempt_scale)
 				> 10 * preempt_val) {
 			set_stage(2);
 			vmcall();
 		}
 	}
+	tsc_val = rdtsc();
+	asm volatile ("hlt");
+	set_stage(4);
+	vmcall();
 }
 
 int preemption_timer_exit_handler()
@@ -147,33 +152,50 @@ int preemption_timer_exit_handler()
 	insn_len = vmcs_read(EXI_INST_LEN);
 	switch (reason) {
 	case VMX_PREEMPT:
-		if (((rdtsc() - tsc_val) >> preempt_scale) < preempt_val)
-			report("Preemption timer", 0);
-		else
-			report("Preemption timer", 1);
+		switch (get_stage()) {
+		case 1:
+		case 2:
+			report("busy-wait for preemption timer",
+			       ((rdtsc() - tsc_val) >> preempt_scale) >=
+			       preempt_val);
+			set_stage(3);
+			vmcs_write(PREEMPT_TIMER_VALUE, preempt_val);
+			return VMX_TEST_RESUME;
+		case 3:
+			report("preemption timer during hlt",
+			       ((rdtsc() - tsc_val) >> preempt_scale) >=
+			       preempt_val);
+			break;
+		default:
+			printf("Invalid stage.\n");
+			print_vmexit_info();
+			break;
+		}
 		break;
 	case VMX_VMCALL:
+		vmcs_write(GUEST_RIP, guest_rip + insn_len);
 		switch (get_stage()) {
 		case 0:
 			if (vmcs_read(PREEMPT_TIMER_VALUE) != preempt_val)
 				report("Save preemption value", 0);
 			else {
-				set_stage(get_stage() + 1);
+				set_stage(1);
 				ctrl_exit = (vmcs_read(EXI_CONTROLS) |
 					EXI_SAVE_PREEMPT) & ctrl_exit_rev.clr;
 				vmcs_write(EXI_CONTROLS, ctrl_exit);
 			}
-			vmcs_write(GUEST_RIP, guest_rip + insn_len);
 			return VMX_TEST_RESUME;
 		case 1:
 			if (vmcs_read(PREEMPT_TIMER_VALUE) >= preempt_val)
 				report("Save preemption value", 0);
 			else
 				report("Save preemption value", 1);
-			vmcs_write(GUEST_RIP, guest_rip + insn_len);
 			return VMX_TEST_RESUME;
 		case 2:
-			report("Preemption timer", 0);
+			report("busy-wait for preemption timer", 0);
+			return VMX_TEST_RESUME;
+		case 3:
+			report("preemption timer during hlt", 0);
 			break;
 		default:
 			// Should not reach here
